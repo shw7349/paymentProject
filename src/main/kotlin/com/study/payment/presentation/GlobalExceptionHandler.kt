@@ -35,6 +35,10 @@ class GlobalExceptionHandler {
     fun handleInvalidState(e: InvalidPaymentStateException): ResponseEntity<ErrorResponse> =
         ResponseEntity.status(HttpStatus.CONFLICT).body(ErrorResponse("INVALID_PAYMENT_STATE", e.message ?: ""))
 
+    @ExceptionHandler(IllegalArgumentException::class)
+    fun handleIllegalArgument(e: IllegalArgumentException): ResponseEntity<ErrorResponse> =
+        ResponseEntity.badRequest().body(ErrorResponse("INVALID_ARGUMENT", e.message ?: ""))
+
     @ExceptionHandler(MethodArgumentNotValidException::class)
     fun handleValidation(e: MethodArgumentNotValidException): ResponseEntity<ErrorResponse> {
         val message = e.bindingResult.fieldErrors.joinToString("; ") { "${it.field}: ${it.defaultMessage}" }
