@@ -14,7 +14,7 @@ com.study.payment
 ├── concurrency         동시성 실험장: Stock, 5가지 재고 차감 전략, ExternalCallSimulator
 ├── infrastructure/lock     Redisson 기반 DistributedLockExecutor
 ├── infrastructure/kafka   KafkaTopics, Producer, Listener(승인/알림), DLT 에러 핸들러
-├── infrastructure/pg      PgClient 인터페이스 + MockPgClient(가상 PG)
+├── infrastructure/pg      PG 연동 추상화: 공통 포트(PaymentGateway) + 라우터 + 어댑터 3종(가상 PG)
 └── presentation           REST 컨트롤러, DTO, 예외 핸들러
 ```
 
@@ -26,8 +26,9 @@ com.study.payment
    이때 `payments.order_id`에 걸린 **DB 유니크 제약**이 락을 우회한 경우에도 중복 저장을 막는 **최종 방어선**이다
    (`DataIntegrityViolationException` → `DuplicatePaymentException`으로 변환, 409 응답).
 3. 저장 후 `PaymentRequestedEvent`를 Kafka(`payment.requested`)에 발행하고, API는 즉시 `202 Accepted`를 반환한다.
-4. `PaymentRequestedEventListener`가 비동기로 이벤트를 소비해 `MockPgClient`로 승인을 시도하고,
-   결과에 따라 `APPROVED`/`FAILED`로 상태를 전이시킨 뒤 `payment.completed` 토픽에 결과를 발행한다.
+4. `PaymentRequestedEventListener`가 비동기로 이벤트를 소비해 `PaymentGatewayRouter`로 승인을 시도하고
+   (결제수단에 맞는 가상 PG 어댑터로 라우팅), 결과에 따라 `APPROVED`/`FAILED`로 상태를 전이시킨 뒤
+   `payment.completed` 토픽에 결과를 발행한다.
 5. `PaymentCompletedEventListener`는 알림 등 후속 구독자를 흉내내어 로그로 결과를 출력한다.
 6. Kafka 리스너 실패 시 `DefaultErrorHandler` + `DeadLetterPublishingRecoverer`가 3회 재시도 후
    `<topic>.DLT`로 보내 파티션이 멈추지 않도록 한다.
@@ -66,7 +67,7 @@ curl localhost:8080/api/payments/order-1
 ```
 
 같은 `orderId`로 동시에 여러 번 요청해도 결제 건은 하나만 생성되고(Redis 락), 이후 수 초 내에
-Kafka 컨슈머가 비동기로 `APPROVED` 또는 `FAILED`로 상태를 갱신한다(`MockPgClient`가 ~90% 확률로 승인).
+Kafka 컨슈머가 비동기로 `APPROVED` 또는 `FAILED`로 상태를 갱신한다(가상 PG 어댑터가 ~90% 확률로 승인).
 
 ## 테스트
 
@@ -83,6 +84,68 @@ Kafka 컨슈머가 비동기로 `APPROVED` 또는 `FAILED`로 상태를 갱신�
   - 비동기 Kafka 컨슈머가 결제를 최종 상태(APPROVED/FAILED)로 전이시키는지
 
 를 검증한다.
+- `PaymentGatewayRouterTest`, `PgAdapterMappingTest`: PG 라우팅 선택과 각 어댑터의 응답 정규화 매핑
+  (결과코드/상태문자열/예외 → 공통 모델)을 목킹으로 검증하는 단위 테스트
+
+---
+
+## PG 연동 추상화 (전략 + 어댑터)
+
+> 여러 PG(결제 게이트웨이)를 **가명 목업**으로 두고, 서로 다른 응답 형태를 하나의 공통 모델로 묶어
+> "결제수단이나 PG 를 추가해도 공통 로직은 건드리지 않는" 구조를 스터디하기 위한 모듈이다.
+> (PG 명은 모두 실제와 무관한 가상 이름이다.)
+
+`com.study.payment.infrastructure.pg` 패키지는 **포트(전략 인터페이스) + 어댑터 + 라우터** 구성으로
+PG 연동을 추상화한다.
+
+```
+infrastructure/pg
+├── PaymentGateway          공통 포트(전략 인터페이스) — 모든 PG 가 구현하는 유일한 계약
+├── PgApprovalCommand/Response, PgCancel*   PG 프로토콜에 종속되지 않는 공통 입출력 모델
+├── PgProvider              PG 식별자(가명): NOVA_PAY, LUNA_PAY, ORBIT_PAY
+├── PgRoutingPolicy         결제수단 → PG 매핑(확장점)
+├── PaymentGatewayRouter    정책에 따라 어댑터를 고르는 공통 진입점(전략 선택기)
+├── adapter/                PG별 어댑터 — 벤더 응답을 공통 모델로 변환
+│   ├── NovaPayGateway      결과코드("0000"=성공) 방식
+│   ├── LunaPayGateway      상태문자열("APPROVED"/"DECLINED") 방식
+│   └── OrbitPayGateway     예외(성공=영수증, 실패=예외) 방식
+└── vendor/                 각 PG 의 고유한 벤더 SDK 를 흉내 낸 목업(NovaPayApi 등)
+```
+
+### 세 가지 가상 PG (일부러 응답 형태를 다르게)
+
+| PG (가명) | 벤더 응답 형태 | 지원 결제수단 | 어댑터가 하는 일 |
+| --- | --- | --- | --- |
+| `NOVA_PAY` | 결과코드 `resultCode`("0000"=성공) | CARD | 코드 비교 → 공통 성공/실패 |
+| `LUNA_PAY` | 상태문자열 `status`("APPROVED"/…) | CARD, VIRTUAL_ACCOUNT | 문자열 비교 → 공통 성공/실패 |
+| `ORBIT_PAY` | 성공=영수증, 실패=예외 | VIRTUAL_ACCOUNT | try/catch → 공통 성공/실패 |
+
+세 PG 의 응답이 코드·문자열·예외로 제각각이지만, **어댑터가 모두 `PgApprovalResponse` 하나로
+정규화**하므로 이를 소비하는 결제 흐름(Kafka 리스너)은 어떤 PG 를 썼는지 전혀 몰라도 된다.
+
+### 흐름
+
+```
+PaymentRequestedEventListener
+        │  PgApprovalCommand(orderId, money, paymentMethod)
+        ▼
+PaymentGatewayRouter ── PgRoutingPolicy 로 결제수단 → provider 결정
+        │               (그리고 그 PG 가 해당 결제수단을 supports 하는지 검증)
+        ▼
+선택된 어댑터(NovaPay/LunaPay/OrbitPay).approve()
+        │  벤더 SDK 호출 후 응답을 공통 모델로 변환
+        ▼
+PgApprovalResponse(approved, provider, pgTransactionId, failureCode/Reason)
+```
+
+### 확장 시 공통 로직은 그대로
+
+- **PG 추가**: `PgProvider` 에 값 추가 + `PaymentGateway` 를 구현한 어댑터 빈 하나 작성.
+  라우터가 스프링 컨텍스트의 모든 `PaymentGateway` 빈을 자동 수집하므로 등록 코드조차 손대지 않는다.
+- **결제수단 추가**: `PaymentMethod` 에 값 추가 + `PgRoutingPolicy` 에 매핑 한 줄 추가.
+  라우터·리스너·기존 어댑터는 변경 없음.
+- **보상 트랜잭션(사가)**: 포트에 `cancel` 이 있어, 후속 단계 실패 시 원 승인을 처리한 PG 로
+  취소를 위임할 수 있다(`pgTransactionId` 로 원거래 지목).
 
 ---
 

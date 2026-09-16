@@ -5,7 +5,8 @@ import com.study.payment.domain.event.PaymentFailedEvent
 import com.study.payment.domain.event.PaymentRequestedEvent
 import com.study.payment.domain.payment.PaymentRepository
 import com.study.payment.domain.payment.PaymentStatus
-import com.study.payment.infrastructure.pg.PgClient
+import com.study.payment.infrastructure.pg.PaymentGatewayRouter
+import com.study.payment.infrastructure.pg.PgApprovalCommand
 import org.slf4j.LoggerFactory
 import org.springframework.kafka.annotation.KafkaListener
 import org.springframework.stereotype.Component
@@ -20,7 +21,7 @@ import org.springframework.transaction.annotation.Transactional
 @Component
 class PaymentRequestedEventListener(
     private val paymentRepository: PaymentRepository,
-    private val pgClient: PgClient,
+    private val paymentGatewayRouter: PaymentGatewayRouter,
     private val eventProducer: PaymentEventProducer
 ) {
     private val log = LoggerFactory.getLogger(javaClass)
@@ -39,14 +40,16 @@ class PaymentRequestedEventListener(
         }
 
         payment.markProcessing()
-        val result = pgClient.approve(payment.orderId, payment.money)
+        val response = paymentGatewayRouter.approve(
+            PgApprovalCommand(payment.orderId, payment.money, payment.paymentMethod)
+        )
 
-        if (result.isSuccess) {
+        if (response.approved) {
             payment.approve()
             paymentRepository.save(payment)
             eventProducer.publishCompleted(PaymentApprovedEvent.from(payment))
         } else {
-            payment.fail(result.failureReason ?: "UNKNOWN_ERROR")
+            payment.fail(response.failureReason ?: "UNKNOWN_ERROR")
             paymentRepository.save(payment)
             eventProducer.publishCompleted(PaymentFailedEvent.from(payment))
         }
